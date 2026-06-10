@@ -1,0 +1,824 @@
+{
+  "name": "Daily QA TC Scanner - ClickUp + DeepSeek",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 18,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "id": "node-cron",
+      "name": "Daily Midnight IST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        380
+      ],
+      "notes": "Fires 18:30 UTC = 00:00 IST daily (timezone Asia/Kolkata)."
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"CLICKUP_LIST_IDS\": [\n    \"901608730150\"\n  ],\n  \"TARGET_STATUSES\": [\n    \"ready for qa\",\n    \"ready for development\",\n    \"in development\",\n    \"story defined\"\n  ],\n  \"ASSIGNEE_USER_ID\": \"94964380\",\n  \"TC_PREFIX\": \"[TC]\",\n  \"MIN_DESC_LENGTH\": 100,\n  \"MAX_TICKETS_PER_RUN\": 10,\n  \"AUTO_ADJUST_BATCH\": true,\n  \"RATE_LIMIT_SECONDS\": 2,\n  \"DEEPSEEK_MODEL\": \"deepseek-v4-pro\",\n  \"DEEPSEEK_MAX_TOKENS\": 16000,\n  \"MIN_TCS\": 12,\n  \"VERIFY_MAX_RETRIES\": 2,\n  \"TEAM_ID\": \"9016989623\"\n}"
+      },
+      "id": "node-config",
+      "name": "Set Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        420,
+        380
+      ],
+      "notes": "Central config. AUTO_ADJUST_BATCH=true processes every candidate. RATE_LIMIT_SECONDS paces ClickUp writes. All ClickUp nodes retry on 429."
+    },
+    {
+      "parameters": {
+        "jsCode": "// EXPAND LIST IDS -> one item per configured list id\nconst cfg = $input.first().json;\nlet ids = cfg.CLICKUP_LIST_IDS;\nif (typeof ids === 'string') { try { ids = JSON.parse(ids); } catch (e) { ids = [ids]; } }\nif (!Array.isArray(ids)) ids = [ids];\nids = ids.filter(Boolean).map(id => String(id).trim());\nif (ids.length === 0) throw new Error('CLICKUP_LIST_IDS is empty - set at least one list id in Set Config.');\nreturn ids.map(id => ({ json: { list_id: id } }));\n"
+      },
+      "id": "node-expand",
+      "name": "Expand List IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        380
+      ],
+      "notes": "One item per list id -> Fetch runs once per list."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.clickup.com/api/v2/list/{{ $json.list_id }}/task",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "subtasks",
+              "value": "false"
+            },
+            {
+              "name": "include_closed",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "page",
+                    "value": "={{ $pageCount }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ $response.body.last_page === true }}",
+              "limitPagesFetched": true,
+              "maxRequests": 200,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "id": "node-fetch",
+      "name": "Fetch Candidate Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        820,
+        380
+      ],
+      "notes": "GET PARENT tickets only (subtasks=false), paginated (page -> until last_page). Retries on 429."
+    },
+    {
+      "parameters": {
+        "jsCode": "// FILTER TARGET-STATUS CANDIDATES\n// Input: ALL paged responses from the parents-only fetch (subtasks=false).\nconst cfg = $('Set Config').first().json;\nlet statuses = cfg.TARGET_STATUSES;\nif (typeof statuses === 'string') { try { statuses = JSON.parse(statuses); } catch (e) { statuses = [statuses]; } }\nif (!Array.isArray(statuses)) statuses = [];\nconst targetStatuses = statuses.map(s => String(s).trim().toLowerCase());\n\nconst pages = $input.all();\n\n// pagination truncation guard: never silently drop tickets\nif (pages.length) {\n  const last = pages[pages.length - 1].json || {};\n  const lastTasks = (last && last.tasks) || [];\n  if (lastTasks.length >= 100 && last.last_page !== true) {\n    throw new Error('Pagination likely truncated: last fetched page returned ' + lastTasks.length +\n      ' tasks but last_page was not true. Increase the Fetch node pagination maxRequests / check pagination config.');\n  }\n}\n\nconst allTasks = [];\nfor (const resp of pages) {\n  const tasks = (resp.json && resp.json.tasks) || [];\n  for (const t of tasks) allTasks.push(t);\n}\nconsole.log('Fetched ' + allTasks.length + ' parent tickets across ' + pages.length + ' page(s).');\n\nconst results = [];\nfor (const task of allTasks) {\n  if (task.parent) continue;\n  const status = ((task.status && task.status.status) || '').toLowerCase();\n  if (targetStatuses.length && !targetStatuses.includes(status)) continue;\n  results.push({ json: {\n    task_id: task.id,\n    task_name: task.name,\n    status: (task.status && task.status.status) || 'unknown',\n    list_id: (task.list && task.list.id) || ''\n  }});\n}\nconsole.log('Target-status candidates: ' + results.length);\n\nif (results.length === 0) {\n  return [{ json: { task_id: '', task_name: 'No matching tickets found', status: 'empty', list_id: '', no_candidates: true } }];\n}\nreturn results;\n"
+      },
+      "id": "node-candidates",
+      "name": "Filter Target-Status Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        380
+      ],
+      "notes": "Flattens ALL pages; throws if pagination truncated; emits top-level tickets in TARGET_STATUSES."
+    },
+    {
+      "parameters": {
+        "jsCode": "// DYNAMIC BATCH LIMITER\nconst cfg = $('Set Config').first().json;\nconst MAX = Number(cfg.MAX_TICKETS_PER_RUN) || 10;\nconst AUTO = cfg.AUTO_ADJUST_BATCH === true || cfg.AUTO_ADJUST_BATCH === 'true';\nconst items = $input.all().filter(i => !i.json.no_candidates);\nif (items.length === 0) return [];\nconst limit = AUTO ? items.length : MAX;\nconst batch = items.slice(0, limit);\nconst overflow = Math.max(0, items.length - batch.length);\nconsole.log('Batch: processing ' + batch.length + ' of ' + items.length + ' candidate tickets (AUTO=' + AUTO + '). Overflow: ' + overflow);\nreturn batch.map(item => ({ json: { ...item.json, total_candidates: items.length, overflow_count: overflow } }));\n"
+      },
+      "id": "node-batch",
+      "name": "Batch Limiter Dynamic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        380
+      ],
+      "notes": "AUTO_ADJUST_BATCH=true -> all candidates; else cap MAX_TICKETS_PER_RUN."
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-loop-tickets",
+      "name": "Loop Each Ticket",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1420,
+        380
+      ],
+      "notes": "One ticket per iteration. Loop output = index 1; done (index 0) ends the run."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.clickup.com/api/v2/task/{{ $json.task_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "include_subtasks",
+              "value": "true"
+            },
+            {
+              "name": "include_markdown_description",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "id": "node-detail",
+      "name": "Get Ticket Detail",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1620,
+        300
+      ],
+      "notes": "Full ticket: nested subtasks[] + markdown_description (requirement). Retries on 429."
+    },
+    {
+      "parameters": {
+        "jsCode": "// EVALUATE COVERAGE (per ticket, from the task-detail response)\nconst detail = $input.first().json;\nconst cfg = $('Set Config').first().json;\nconst MIN_DESC = Number(cfg.MIN_DESC_LENGTH) || 100;\nconst TC_PREFIX = cfg.TC_PREFIX || '[TC]';\nconst ticket = $('Loop Each Ticket').first().json;\n\nconst subtasks = detail.subtasks || [];\nconst tcChildren = subtasks.filter(st => st.name && st.name.trim().startsWith(TC_PREFIX));\nconst hasTCs = tcChildren.length > 0;\n\nconst requirement = detail.markdown_description || detail.description || detail.text_content || '';\nconst isThin = requirement.trim().length < MIN_DESC;\n\nlet action = 'skip';\nif (hasTCs) action = 'skip';\nelse if (!isThin) action = 'generate';\nelse action = 'monitor';\n\nreturn [{ json: {\n  task_id: detail.id || ticket.task_id,\n  task_name: detail.name || ticket.task_name,\n  status: (detail.status && detail.status.status) || ticket.status || 'unknown',\n  list_id: (detail.list && detail.list.id) || ticket.list_id || '',\n  requirement: requirement,\n  has_tcs: hasTCs,\n  existing_tc_count: tcChildren.length,\n  is_thin: isThin,\n  action: action,\n  need_generate: action === 'generate'\n}}];\n"
+      },
+      "id": "node-evaluate",
+      "name": "Evaluate Coverage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ],
+      "notes": "hasTCs + thin-desc -> action generate/skip/monitor; carries requirement text."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-need",
+              "leftValue": "={{ $json.need_generate }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-filter-need",
+      "name": "Filter Needs Generation",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2020,
+        300
+      ],
+      "notes": "TRUE -> generate. FALSE (covered / thin) -> advance outer loop."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.deepseek.com/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: $('Set Config').first().json.DEEPSEEK_MODEL,\n  max_tokens: $('Set Config').first().json.DEEPSEEK_MAX_TOKENS,\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a Senior QA Architect with 20+ years of enterprise testing experience.\\n\\nGenerate comprehensive test cases for the given ClickUp ticket, based ONLY on the ticket requirement/description provided.\\n\\nRETURN ONLY A VALID JSON ARRAY - no markdown fences, no backticks, no preamble, no explanation.\\n\\nEach test case object MUST have these exact keys:\\n- tc_id: string (e.g. \"TC_001\")\\n- title: string (concise descriptive title)\\n- type: string (one of: \"Smoke\", \"Functional - Positive\", \"Functional - Negative\", \"Security\", \"Performance\", \"Non-Functional\", \"Edge Case\", \"Regression\")\\n- priority: string (one of: \"urgent\", \"high\", \"normal\", \"low\")\\n- module: string (feature area)\\n- objective: string (what this test verifies)\\n- preconditions: string (setup required)\\n- steps: string (numbered test steps)\\n- test_data: string (input data needed)\\n- expected_result: string (expected outcome)\\n\\nCoverage requirements:\\n- Generate at least ' + $('Set Config').first().json.MIN_TCS + ' test cases, but INCREASE the count until EVERY scenario category is covered - never stop at the minimum if coverage is incomplete.\\n- MUST include all types: Smoke, Functional Positive, Functional Negative, Security, Performance, Non-Functional/Edge Case, Regression.\\n- Priority mix roughly: 25% urgent, 35% high, 25% normal, 15% low.\\n- Every TC must be specific, actionable and independently executable.\\n- Security TCs: token tampering, PII exposure, auth bypass, injection.\\n- Performance TCs: load, concurrency, response-time thresholds.\\n- Edge TCs: null/boundary values, rapid repeated actions.\\n- Regression TCs: verify existing flows remain unaffected.\\n\\nReturn ONLY the JSON array.'\n    },\n    {\n      role: 'user',\n      content: 'Generate comprehensive test cases for this ticket:\\n\\nTicket: ' + $json.task_name + '\\nStatus: ' + $json.status + '\\n\\nFull Requirement / Description:\\n' + ($json.requirement || '').substring(0, 8000) + '\\n\\nReturn ONLY a valid JSON array.'\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "deepseek-header-auth",
+          "name": "DeepSeek API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "id": "node-deepseek",
+      "name": "DeepSeek Generate TCs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2220,
+        220
+      ],
+      "notes": "DeepSeek (OpenAI-compatible). Requirement from Evaluate Coverage. Model from config."
+    },
+    {
+      "parameters": {
+        "jsCode": "// PARSE DEEPSEEK RESPONSE -> one item per test case\nconst response = $input.first().json;\nconst cfg = $('Set Config').first().json;\nconst TC_PREFIX = cfg.TC_PREFIX || '[TC]';\nconst assignee = cfg.ASSIGNEE_USER_ID || '';\n\nlet ticketData = {};\ntry { ticketData = $('Evaluate Coverage').first().json; }\ncatch (e) { ticketData = {}; }\ntry { if (!ticketData.task_id) ticketData = $('Loop Each Ticket').first().json; } catch (e) {}\n\nlet textContent = '';\nif (response.choices && response.choices[0] && response.choices[0].message) {\n  textContent = response.choices[0].message.content || '';\n} else if (typeof response === 'string') {\n  textContent = response;\n}\n\nlet clean = textContent.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\nlet testCases = [];\ntry {\n  testCases = JSON.parse(clean);\n} catch (e) {\n  const m = clean.match(/\\[[\\s\\S]*\\]/);\n  if (m) {\n    try { testCases = JSON.parse(m[0]); }\n    catch (e2) {\n      return [{ json: { error: true, error_type: 'parse_failure', task_id: ticketData.task_id, task_name: ticketData.task_name, parse_error: e2.message, raw_preview: textContent.substring(0, 300) } }];\n    }\n  } else {\n    return [{ json: { error: true, error_type: 'no_json_found', task_id: ticketData.task_id, task_name: ticketData.task_name, raw_preview: textContent.substring(0, 300) } }];\n  }\n}\n\nif (!Array.isArray(testCases) || testCases.length === 0) {\n  return [{ json: { error: true, error_type: 'empty_array', task_id: ticketData.task_id, task_name: ticketData.task_name } }];\n}\n\nreturn testCases.map((tc, index) => {\n  const tc_id = tc.tc_id || ('TC_' + String(index + 1).padStart(3, '0'));\n  const title = tc.title || 'Untitled Test Case';\n  return { json: {\n    tc_id: tc_id,\n    title: title,\n    tc_name: TC_PREFIX + ' ' + tc_id + ' - ' + title,\n    type: tc.type || 'Functional - Positive',\n    priority: tc.priority || 'normal',\n    module: tc.module || 'General',\n    objective: tc.objective || '',\n    preconditions: tc.preconditions || 'None',\n    steps: tc.steps || '',\n    test_data: tc.test_data || 'N/A',\n    expected_result: tc.expected_result || '',\n    parent_task_id: ticketData.task_id,\n    task_name: ticketData.task_name,\n    list_id: ticketData.list_id || '',\n    assignee_id: assignee,\n    tc_index: index + 1,\n    total_tcs: testCases.length,\n    error: false\n  }};\n});\n"
+      },
+      "id": "node-parse",
+      "name": "Parse TCs from DeepSeek",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        220
+      ],
+      "notes": "choices[0].message.content -> per-TC items; sets tc_name = '[TC] <id> - <title>'."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-noerror",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "={{ false }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-filter-parse",
+      "name": "Filter Parse Errors",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        220
+      ],
+      "notes": "TRUE -> Loop Each TC. FALSE -> advance outer loop."
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-loop-tcs",
+      "name": "Loop Each TC",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2820,
+        220
+      ],
+      "notes": "One TC per iteration (loop = index 1). Done (index 0) -> Verify Coverage."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.clickup.com/api/v2/list/{{ $json.list_id }}/task",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  name: $json.tc_name || (($('Set Config').first().json.TC_PREFIX || '[TC]') + ' ' + ($json.tc_id || 'TC') + ' - ' + ($json.title || 'Test Case')),\n  parent: $json.parent_task_id,\n  assignees: $json.assignee_id ? [parseInt($json.assignee_id)] : [],\n  priority: $json.priority === 'urgent' ? 1 : $json.priority === 'high' ? 2 : $json.priority === 'normal' ? 3 : 4,\n  markdown_description: '## Test Case Details\\n' +\n    '**TC ID:** ' + ($json.tc_id || '') + '\\n' +\n    '**Module:** ' + ($json.module || '') + '\\n' +\n    '**Type:** ' + ($json.type || '') + '\\n' +\n    '**Priority:** ' + ($json.priority || '') + '\\n' +\n    '**Objective:** ' + ($json.objective || '') + '\\n\\n' +\n    '## Preconditions\\n' + ($json.preconditions || 'None') + '\\n\\n' +\n    '## Steps\\n' + ($json.steps || '') + '\\n\\n' +\n    '## Test Data\\n' + ($json.test_data || 'N/A') + '\\n\\n' +\n    '## Expected Result\\n' + ($json.expected_result || '')\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "id": "node-create",
+      "name": "Create TC Subtask in ClickUp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3020,
+        160
+      ],
+      "notes": "Creates a [TC] subtask under the parent. Retries on 429 (5x, 5s backoff)."
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Set Config').first().json.RATE_LIMIT_SECONDS }}",
+        "unit": "seconds"
+      },
+      "id": "node-wait",
+      "name": "Wait Rate Limit",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3220,
+        160
+      ],
+      "notes": "Paces ClickUp writes by RATE_LIMIT_SECONDS (default 2s). Do not remove."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.clickup.com/api/v2/task/{{ $('Loop Each Ticket').first().json.task_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "include_subtasks",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "id": "node-verify",
+      "name": "Verify Coverage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3020,
+        360
+      ],
+      "notes": "Re-fetch the ticket's subtasks to confirm generated [TC] exist. Retries on 429 (5x, 5s backoff)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ASSERT COVERAGE (verify each ticket actually got its [TC] subtasks)\nconst cfg = $('Set Config').first().json;\nconst TC_PREFIX = cfg.TC_PREFIX || '[TC]';\nconst MAX_RETRIES = Number(cfg.VERIFY_MAX_RETRIES);\nconst maxRetries = Number.isFinite(MAX_RETRIES) ? MAX_RETRIES : 2;\n\nconst detail = $input.first().json;\nconst generated = $('Parse TCs from DeepSeek').all().map(i => i.json).filter(t => t && t.error !== true);\nif (generated.length === 0) {\n  return [{ json: { coverage_ok: true, parent_task_id: (detail && detail.id) || '', note: 'no_generated_tcs' } }];\n}\n\nconst parentId = generated[0].parent_task_id || (detail && detail.id) || '';\nconst ticketName = generated[0].task_name || (detail && detail.name) || parentId;\n\nconst existingNames = (detail.subtasks || [])\n  .map(st => (st.name || '').trim())\n  .filter(n => n.startsWith(TC_PREFIX));\nconst existingSet = new Set(existingNames);\n\nconst missing = generated.filter(tc => !existingSet.has((tc.tc_name || '').trim()));\n\nlet attempt = 0;\ntry { attempt = Number($json.verify_attempt) || 0; } catch (e) { attempt = 0; }\n\nif (missing.length === 0) {\n  return [{ json: { coverage_ok: true, parent_task_id: parentId, verified: existingNames.length, expected: generated.length } }];\n}\n\nif (attempt >= maxRetries) {\n  throw new Error('TC coverage incomplete for \"' + ticketName + '\" (' + parentId + '): found ' +\n    (generated.length - missing.length) + '/' + generated.length + ' after ' + attempt +\n    ' retr(y/ies). Missing: ' + missing.map(m => m.tc_name).join(' | '));\n}\n\nreturn missing.map(tc => ({ json: { ...tc, coverage_ok: false, verify_attempt: attempt + 1 } }));\n"
+      },
+      "id": "node-assert",
+      "name": "Assert Coverage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3220,
+        360
+      ],
+      "notes": "Generated [TC] vs existing. All present -> coverage_ok. Missing + retries left -> re-emit. Missing + no retries -> THROW."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-ok",
+              "leftValue": "={{ $json.coverage_ok }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-filter-ok",
+      "name": "Filter Coverage OK",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3420,
+        360
+      ],
+      "notes": "TRUE -> advance outer loop. FALSE (missing) -> recreate."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.clickup.com/api/v2/list/{{ $json.list_id }}/task",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  name: $json.tc_name || (($('Set Config').first().json.TC_PREFIX || '[TC]') + ' ' + ($json.tc_id || 'TC') + ' - ' + ($json.title || 'Test Case')),\n  parent: $json.parent_task_id,\n  assignees: $json.assignee_id ? [parseInt($json.assignee_id)] : [],\n  priority: $json.priority === 'urgent' ? 1 : $json.priority === 'high' ? 2 : $json.priority === 'normal' ? 3 : 4,\n  markdown_description: '## Test Case Details\\n' +\n    '**TC ID:** ' + ($json.tc_id || '') + '\\n' +\n    '**Module:** ' + ($json.module || '') + '\\n' +\n    '**Type:** ' + ($json.type || '') + '\\n' +\n    '**Priority:** ' + ($json.priority || '') + '\\n' +\n    '**Objective:** ' + ($json.objective || '') + '\\n\\n' +\n    '## Preconditions\\n' + ($json.preconditions || 'None') + '\\n\\n' +\n    '## Steps\\n' + ($json.steps || '') + '\\n\\n' +\n    '## Test Data\\n' + ($json.test_data || 'N/A') + '\\n\\n' +\n    '## Expected Result\\n' + ($json.expected_result || '')\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "id": "node-recreate",
+      "name": "Recreate Missing TCs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3620,
+        440
+      ],
+      "notes": "Re-create [TC] subtasks verification found missing. Retries on 429 (5x, 5s backoff)."
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Set Config').first().json.RATE_LIMIT_SECONDS }}",
+        "unit": "seconds"
+      },
+      "id": "node-wait2",
+      "name": "Wait (Recreate)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3820,
+        440
+      ],
+      "notes": "Paces recreate writes by RATE_LIMIT_SECONDS, then re-verify."
+    }
+  ],
+  "connections": {
+    "Daily Midnight IST": {
+      "main": [
+        [
+          {
+            "node": "Set Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Config": {
+      "main": [
+        [
+          {
+            "node": "Expand List IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand List IDs": {
+      "main": [
+        [
+          {
+            "node": "Fetch Candidate Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Candidate Tickets": {
+      "main": [
+        [
+          {
+            "node": "Filter Target-Status Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Target-Status Candidates": {
+      "main": [
+        [
+          {
+            "node": "Batch Limiter Dynamic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Limiter Dynamic": {
+      "main": [
+        [
+          {
+            "node": "Loop Each Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Each Ticket": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Get Ticket Detail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Ticket Detail": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Coverage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Coverage": {
+      "main": [
+        [
+          {
+            "node": "Filter Needs Generation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Needs Generation": {
+      "main": [
+        [
+          {
+            "node": "DeepSeek Generate TCs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Each Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DeepSeek Generate TCs": {
+      "main": [
+        [
+          {
+            "node": "Parse TCs from DeepSeek",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse TCs from DeepSeek": {
+      "main": [
+        [
+          {
+            "node": "Filter Parse Errors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Parse Errors": {
+      "main": [
+        [
+          {
+            "node": "Loop Each TC",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Each Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Each TC": {
+      "main": [
+        [
+          {
+            "node": "Verify Coverage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create TC Subtask in ClickUp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create TC Subtask in ClickUp": {
+      "main": [
+        [
+          {
+            "node": "Wait Rate Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Rate Limit": {
+      "main": [
+        [
+          {
+            "node": "Loop Each TC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Coverage": {
+      "main": [
+        [
+          {
+            "node": "Assert Coverage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assert Coverage": {
+      "main": [
+        [
+          {
+            "node": "Filter Coverage OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Coverage OK": {
+      "main": [
+        [
+          {
+            "node": "Loop Each Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Recreate Missing TCs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recreate Missing TCs": {
+      "main": [
+        [
+          {
+            "node": "Wait (Recreate)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (Recreate)": {
+      "main": [
+        [
+          {
+            "node": "Verify Coverage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Asia/Kolkata",
+    "saveExecutionProgress": true
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "qa-automation"
+    },
+    {
+      "name": "clickup"
+    },
+    {
+      "name": "deepseek"
+    },
+    {
+      "name": "daily-scanner"
+    }
+  ],
+  "triggerCount": 1,
+  "versionId": "3.2.0"
+}
