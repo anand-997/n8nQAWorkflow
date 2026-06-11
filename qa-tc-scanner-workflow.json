@@ -25,7 +25,7 @@
     {
       "parameters": {
         "mode": "raw",
-        "jsonOutput": "{\n  \"CLICKUP_LIST_IDS\": [\n    \"901608730150\"\n  ],\n  \"TARGET_STATUSES\": [\n    \"ready for qa\",\n    \"ready for development\",\n    \"in development\",\n    \"story defined\"\n  ],\n  \"ASSIGNEE_USER_ID\": \"94964380\",\n  \"TC_PREFIX\": \"[TC]\",\n  \"MIN_DESC_LENGTH\": 100,\n  \"MAX_TICKETS_PER_RUN\": 10,\n  \"AUTO_ADJUST_BATCH\": true,\n  \"RATE_LIMIT_SECONDS\": 2,\n  \"DEEPSEEK_MODEL\": \"deepseek-v4-pro\",\n  \"DEEPSEEK_MAX_TOKENS\": 16000,\n  \"MIN_TCS\": 12,\n  \"VERIFY_MAX_RETRIES\": 2,\n  \"TEAM_ID\": \"9016989623\"\n}"
+        "jsonOutput": "{\n  \"CLICKUP_LIST_IDS\": [\n    \"901608730150\"\n  ],\n  \"TARGET_STATUSES\": [\n    \"ready for qa\",\n    \"ready for development\",\n    \"in development\",\n    \"story defined\"\n  ],\n  \"ASSIGNEE_USER_ID\": \"94964380\",\n  \"TC_PREFIX\": \"[TC]\",\n  \"MIN_DESC_LENGTH\": 100,\n  \"MAX_TICKETS_PER_RUN\": 10,\n  \"AUTO_ADJUST_BATCH\": true,\n  \"RATE_LIMIT_SECONDS\": 2,\n  \"DEEPSEEK_MODEL\": \"deepseek-v4-pro\",\n  \"DEEPSEEK_MAX_TOKENS\": 16000,\n  \"MIN_TCS\": 12,\n  \"VERIFY_MAX_RETRIES\": 2,\n  \"TEAM_ID\": \"9016989623\",\n  \"MAIN_WORKFLOW_ID\": \"\",\n  \"N8N_BASE_URL\": \"http://localhost:5678\",\n  \"MAX_AUTO_RERUNS_PER_DAY\": 2,\n  \"STUCK_MINUTES\": 20,\n  \"EXPECTED_RUN_HOUR\": 0,\n  \"TEAMS_WEBHOOK_URL\": \"\",\n  \"ALERTS_CLICKUP_LIST_ID\": \"901608730150\",\n  \"ALERTS_TASK_ID\": \"\",\n  \"DASHBOARD_TASK_ID\": \"\",\n  \"DASHBOARD_HISTORY_LIMIT\": 30\n}"
       },
       "id": "node-config",
       "name": "Set Config",
@@ -126,7 +126,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// DYNAMIC BATCH LIMITER\nconst cfg = $('Set Config').first().json;\nconst MAX = Number(cfg.MAX_TICKETS_PER_RUN) || 10;\nconst AUTO = cfg.AUTO_ADJUST_BATCH === true || cfg.AUTO_ADJUST_BATCH === 'true';\nconst items = $input.all().filter(i => !i.json.no_candidates);\nif (items.length === 0) return [];\nconst limit = AUTO ? items.length : MAX;\nconst batch = items.slice(0, limit);\nconst overflow = Math.max(0, items.length - batch.length);\nconsole.log('Batch: processing ' + batch.length + ' of ' + items.length + ' candidate tickets (AUTO=' + AUTO + '). Overflow: ' + overflow);\nreturn batch.map(item => ({ json: { ...item.json, total_candidates: items.length, overflow_count: overflow } }));\n"
+        "jsCode": "// DYNAMIC BATCH LIMITER\nconst cfg = $('Set Config').first().json;\nconst MAX = Number(cfg.MAX_TICKETS_PER_RUN) || 10;\nconst AUTO = cfg.AUTO_ADJUST_BATCH === true || cfg.AUTO_ADJUST_BATCH === 'true';\nconst items = $input.all().filter(i => !i.json.no_candidates);\nif (items.length === 0) return [];\nconst limit = AUTO ? items.length : MAX;\nconst batch = items.slice(0, limit);\nconst overflow = Math.max(0, items.length - batch.length);\nconsole.log('Batch: processing ' + batch.length + ' of ' + items.length + ' candidate tickets (AUTO=' + AUTO + '). Overflow: ' + overflow);\nconst sd = $getWorkflowStaticData('global');\nsd.currentRun = { scanned: batch.length, updated: 0, tcs_created: 0, failed: 0, parse_failures: 0, started_at: new Date().toISOString() };\nreturn batch.map(item => ({ json: { ...item.json, total_candidates: items.length, overflow_count: overflow } }));\n"
       },
       "id": "node-batch",
       "name": "Batch Limiter Dynamic",
@@ -532,6 +532,731 @@
         440
       ],
       "notes": "Paces recreate writes by RATE_LIMIT_SECONDS, then re-verify."
+    },
+    {
+      "parameters": {},
+      "id": "node-exec-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nconst cfg = $('Set Config').first().json;\nconst LIMIT = Number(cfg.DASHBOARD_HISTORY_LIMIT) || 30;\nconst cur = sd.currentRun || { scanned:0, updated:0, tcs_created:0, failed:0, parse_failures:0 };\nconst scanned = cur.scanned || 0;\nconst skipped = Math.max(0, scanned - (cur.updated||0) - (cur.failed||0));\nconst rec = { run_at: new Date().toISOString(), execution_id: $execution.id, tickets_scanned: scanned, tickets_updated: cur.updated||0, tickets_skipped: skipped, tickets_failed: cur.failed||0, tcs_created: cur.tcs_created||0, parse_failures: cur.parse_failures||0, status: (cur.failed||0) > 0 ? 'partial' : 'success' };\nif (!Array.isArray(sd.runHistory)) sd.runHistory = [];\nsd.runHistory.push(rec);\nif (sd.runHistory.length > LIMIT) sd.runHistory = sd.runHistory.slice(-LIMIT);\nsd.currentRun = null;\nconst title = 'QA TC Scanner — run complete';\nconst text = 'Scanned ' + rec.tickets_scanned + ' | Updated ' + rec.tickets_updated + ' | Skipped ' + rec.tickets_skipped + ' | Failed ' + rec.tickets_failed + ' | TCs created ' + rec.tcs_created;\nconst card = JSON.stringify({ '@type':'MessageCard', '@context':'http://schema.org/extensions', themeColor:'2EB67D', summary:title, title:'✅ '+title, text:text });\nreturn [{ json: { notify_source:'run_summary', notify_title:title, notify_text:text, teams_webhook_url: cfg.TEAMS_WEBHOOK_URL||'', teams_card: card, alerts_task_id: cfg.ALERTS_TASK_ID||'', clickup_comment_text: '🤖 '+title+'\\n\\n'+text } }];\n"
+      },
+      "id": "node-build-summary",
+      "name": "Build Run Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const assert = $input.first().json;\nconst ticketId = assert.parent_task_id || '';\nconst tcs = $('Parse TCs from DeepSeek').all().map(i => i.json).filter(t => t && t.error !== true);\nconst ticketName = (tcs[0] && tcs[0].task_name) || ticketId;\nconst byType = {}; const byPrio = {};\nfor (const t of tcs) { byType[t.type]=(byType[t.type]||0)+1; byPrio[t.priority]=(byPrio[t.priority]||0)+1; }\nconst typeLines = Object.keys(byType).map(k => '- ' + k + ': ' + byType[k]).join('\\n');\nconst prioLines = Object.keys(byPrio).map(k => k + '=' + byPrio[k]).join(', ');\nconst names = tcs.map(t => '- ' + t.tc_name).join('\\n');\nconst comment = '🤖 QA Bot: added ' + tcs.length + ' test case(s).\\n\\n**By type:**\\n' + typeLines + '\\n\\n**By priority:** ' + prioLines + '\\n\\n**Test cases:**\\n' + names;\nconst sd = $getWorkflowStaticData('global');\nif (!sd.currentRun) sd.currentRun = { scanned:0, updated:0, tcs_created:0, failed:0, parse_failures:0 };\nsd.currentRun.updated += 1; sd.currentRun.tcs_created += tcs.length;\nreturn [{ json: { ticket_id: ticketId, ticket_name: ticketName, tc_count: tcs.length, clickup_comment: comment } }];\n"
+      },
+      "id": "node-build-tc-comment",
+      "name": "Build TC Comment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3620,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.clickup.com/api/v2/task/{{ $json.ticket_id }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({comment_text: $json.clickup_comment, notify_all: false}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "id": "node-comment-tcs",
+      "name": "Comment TCs Added",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\nconst sd = $getWorkflowStaticData('global');\nif (!sd.currentRun) sd.currentRun = { scanned:0, updated:0, tcs_created:0, failed:0, parse_failures:0 };\nsd.currentRun.failed += 1; sd.currentRun.parse_failures += 1;\nconst comment = '🤖 QA Bot: ⚠️ test-case generation FAILED (' + (e.error_type||'unknown') + '). No [TC] subtasks created this run.\\n\\nRaw model preview:\\n```\\n' + String(e.raw_preview||'(none)').substring(0,400) + '\\n```';\nreturn [{ json: { ticket_id: e.task_id || '', ticket_name: e.task_name || '', error_type: e.error_type||'unknown', clickup_comment: comment } }];\n"
+      },
+      "id": "node-build-fail-comment",
+      "name": "Build Failure Comment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.clickup.com/api/v2/task/{{ $json.ticket_id }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({comment_text: $json.clickup_comment, notify_all: false}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "id": "node-comment-fail",
+      "name": "Comment Generation Failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2820,
+        380
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "node-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "rc-0",
+              "name": "TEAMS_WEBHOOK_URL",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "rc-1",
+              "name": "ALERTS_TASK_ID",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "rc-2",
+              "name": "ALERTS_CLICKUP_LIST_ID",
+              "value": "901608730150",
+              "type": "string"
+            },
+            {
+              "id": "rc-3",
+              "name": "MAIN_WORKFLOW_ID",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "rc-4",
+              "name": "N8N_BASE_URL",
+              "value": "http://localhost:5678",
+              "type": "string"
+            },
+            {
+              "id": "rc-5",
+              "name": "MAX_AUTO_RERUNS_PER_DAY",
+              "value": 2,
+              "type": "number"
+            },
+            {
+              "id": "rc-6",
+              "name": "STUCK_MINUTES",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "rc-7",
+              "name": "EXPECTED_RUN_HOUR",
+              "value": 0,
+              "type": "number"
+            },
+            {
+              "id": "rc-8",
+              "name": "DASHBOARD_TASK_ID",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "rc-9",
+              "name": "DASHBOARD_HISTORY_LIMIT",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "rc-10",
+              "name": "DEEPSEEK_MODEL",
+              "value": "deepseek-v4-pro",
+              "type": "string"
+            },
+            {
+              "id": "rc-11",
+              "name": "DEEPSEEK_MAX_TOKENS",
+              "value": 2000,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-remediation-config",
+      "name": "Remediation Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        440,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst err = (item.execution && item.execution.error) || {};\nconst msg = (err.message || JSON.stringify(err) || '').toString();\nconst lastNode = (item.execution && item.execution.lastNodeExecuted) || '';\nconst lower = msg.toLowerCase();\nconst sd = $getWorkflowStaticData('global');\nconst cur = sd.currentRun || { scanned:0, updated:0, tcs_created:0, failed:0, parse_failures:0 };\nconst LIMIT = Number(item.DASHBOARD_HISTORY_LIMIT) || 30;\nif (!Array.isArray(sd.runHistory)) sd.runHistory = [];\nsd.runHistory.push({ run_at:new Date().toISOString(), execution_id:(item.execution&&item.execution.id)||'', tickets_scanned:cur.scanned||0, tickets_updated:cur.updated||0, tickets_skipped:Math.max(0,(cur.scanned||0)-(cur.updated||0)-(cur.failed||0)), tickets_failed:cur.failed||0, tcs_created:cur.tcs_created||0, parse_failures:cur.parse_failures||0, status:'error', error:msg.substring(0,300), failed_node:lastNode });\nif (sd.runHistory.length > LIMIT) sd.runHistory = sd.runHistory.slice(-LIMIT);\nsd.currentRun = null;\nlet category='unknown', is_auto_fixable=false, action='escalate';\nif (lower.includes('429')||lower.includes('rate limit')||lower.includes('too many requests')) { category='transient_rate_limit'; is_auto_fixable=true; action='rerun'; }\nelse if (lower.includes('econnreset')||lower.includes('etimedout')||lower.includes('timeout')||/\\b50\\d\\b/.test(msg)||lower.includes('socket hang up')) { category='transient_upstream'; is_auto_fixable=true; action='rerun'; }\nelse if (lastNode==='DeepSeek Generate TCs'||lastNode==='Parse TCs from DeepSeek'||lower.includes('json')||lower.includes('parse')) { category='generation_parse'; is_auto_fixable=true; action='rerun'; }\nelse if (lower.includes('coverage incomplete')||lastNode==='Assert Coverage') { category='coverage_incomplete'; is_auto_fixable=true; action='rerun'; }\nelse if (lower.includes('401')||lower.includes('403')||lower.includes('authorization')||lower.includes('unauthorized')||lower.includes('forbidden')) { category='auth'; is_auto_fixable=false; action='escalate'; }\nreturn [{ json: { ...item, error_message:msg, failed_node:lastNode, execution_id:(item.execution&&item.execution.id)||'', execution_url:(item.execution&&item.execution.url)||'', workflow_name:(item.workflow&&item.workflow.name)||'', category, is_auto_fixable, action, known: category!=='unknown' } }];\n"
+      },
+      "id": "node-classify",
+      "name": "Classify Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-known",
+              "leftValue": "={{ $json.known }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-if-known",
+      "name": "IF Known",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.deepseek.com/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $json.DEEPSEEK_MODEL, max_tokens: $json.DEEPSEEK_MAX_TOKENS, messages: [ {role:'system', content:'You are an SRE assistant. Classify the n8n workflow failure. Return ONLY a JSON object with keys: category (string), is_auto_fixable (boolean), suggested_action (string), human_summary (string). No markdown, no fences.'}, {role:'user', content:'Failed node: ' + ($json.failed_node||'') + '\\nError: ' + ($json.error_message||'') } ] }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "deepseek-header-auth",
+          "name": "DeepSeek API (Header Auth)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "id": "node-deepseek-classify",
+      "name": "DeepSeek Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        940
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Classify Failure').first().json;\nconst resp = $input.first().json;\nlet txt='';\nif (resp && resp.choices && resp.choices[0] && resp.choices[0].message) txt = resp.choices[0].message.content || '';\nlet parsed=null;\ntry { parsed = JSON.parse(String(txt).replace(/```json/gi,'').replace(/```/g,'').trim()); }\ncatch(e){ const m=String(txt).match(/\\{[\\s\\S]*\\}/); if(m){ try{ parsed=JSON.parse(m[0]); }catch(e2){} } }\nconst out = { ...base };\nif (parsed && typeof parsed==='object') { out.category = parsed.category || base.category; out.is_auto_fixable = parsed.is_auto_fixable === true; out.action = out.is_auto_fixable ? 'rerun' : 'escalate'; out.llm_summary = parsed.human_summary || parsed.suggested_action || ''; }\nout.known = true;\nreturn [{ json: out }];\n"
+      },
+      "id": "node-parse-classify",
+      "name": "Parse Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        940
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst sd = $getWorkflowStaticData('global');\nconst day = new Date().toISOString().slice(0,10);\nif (!sd.reruns) sd.reruns = {};\nconst used = sd.reruns[day] || 0;\nconst MAX = Number(item.MAX_AUTO_RERUNS_PER_DAY); const max = Number.isFinite(MAX) ? MAX : 2;\nlet do_rerun = false;\nif (item.is_auto_fixable && used < max) { do_rerun = true; sd.reruns[day] = used + 1; }\nreturn [{ json: { ...item, do_rerun, reruns_used: sd.reruns[day]||used, reruns_max: max } }];\n"
+      },
+      "id": "node-rerun-guard",
+      "name": "Re-run Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-autofix",
+              "leftValue": "={{ $json.do_rerun }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-if-autofix",
+      "name": "IF Auto-fix",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": "={{ $json.MAIN_WORKFLOW_ID }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput",
+      "id": "node-retrigger",
+      "name": "Re-trigger Scanner",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1980,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const it = $input.first().json;\nconst fixed = it.do_rerun ? ('auto re-ran the scanner (' + it.reruns_used + '/' + it.reruns_max + ' today)') : 'no auto-fix applied';\nconst title = it.is_auto_fixable ? '⚠️ QA Scanner failure (auto-handled)' : '🚨 QA Scanner failure (needs attention)';\nconst text = 'Workflow: ' + (it.workflow_name||'') + '\\nFailed node: ' + (it.failed_node||'?') + '\\nCategory: ' + it.category + '\\nAction: ' + fixed + (it.llm_summary ? '\\nLLM: ' + it.llm_summary : '') + '\\nError: ' + String(it.error_message||'').substring(0,400) + (it.execution_url ? '\\nExecution: ' + it.execution_url : '');\nconst color = it.is_auto_fixable ? 'E2A100' : 'D7263D';\nconst card = JSON.stringify({ '@type':'MessageCard', '@context':'http://schema.org/extensions', themeColor: color, summary: title, title: title, text: text.split('\\n').join('\\n\\n') });\nreturn [{ json: { notify_source:'remediation', notify_title:title, notify_text:text, teams_webhook_url: it.TEAMS_WEBHOOK_URL||'', teams_card: card, alerts_task_id: it.ALERTS_TASK_ID||'', clickup_comment_text: '🤖 '+title+'\\n\\n'+text } }];\n"
+      },
+      "id": "node-build-remediation",
+      "name": "Build Remediation Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "node-monitor-schedule",
+      "name": "Monitor Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "mc-0",
+              "name": "TEAMS_WEBHOOK_URL",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "mc-1",
+              "name": "ALERTS_TASK_ID",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "mc-2",
+              "name": "ALERTS_CLICKUP_LIST_ID",
+              "value": "901608730150",
+              "type": "string"
+            },
+            {
+              "id": "mc-3",
+              "name": "MAIN_WORKFLOW_ID",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "mc-4",
+              "name": "N8N_BASE_URL",
+              "value": "http://localhost:5678",
+              "type": "string"
+            },
+            {
+              "id": "mc-5",
+              "name": "MAX_AUTO_RERUNS_PER_DAY",
+              "value": 2,
+              "type": "number"
+            },
+            {
+              "id": "mc-6",
+              "name": "STUCK_MINUTES",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "mc-7",
+              "name": "EXPECTED_RUN_HOUR",
+              "value": 0,
+              "type": "number"
+            },
+            {
+              "id": "mc-8",
+              "name": "DASHBOARD_TASK_ID",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "mc-9",
+              "name": "DASHBOARD_HISTORY_LIMIT",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "mc-10",
+              "name": "DEEPSEEK_MODEL",
+              "value": "deepseek-v4-pro",
+              "type": "string"
+            },
+            {
+              "id": "mc-11",
+              "name": "DEEPSEEK_MAX_TOKENS",
+              "value": 2000,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-monitor-config",
+      "name": "Monitor Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        440,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.N8N_BASE_URL }}/api/v1/executions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "workflowId",
+              "value": "={{ $json.MAIN_WORKFLOW_ID }}"
+            },
+            {
+              "name": "limit",
+              "value": "50"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "n8n-api-header-auth",
+          "name": "n8n API (Header Auth)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "id": "node-fetch-execs",
+      "name": "Fetch Executions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Monitor Config').first().json;\nconst resp = $input.first().json;\nconst list = (resp && (resp.data || resp.results)) || (Array.isArray(resp) ? resp : null);\nconst execs = Array.isArray(list) ? list : [];\nconst apiDown = !Array.isArray(list);\nconst now = Date.now();\nconst STUCK = (Number(cfg.STUCK_MINUTES)||20) * 60000;\nconst expectedHour = Number(cfg.EXPECTED_RUN_HOUR);\nconst failed = execs.filter(e => e.status==='error').slice(0,10);\nconst stuck = execs.filter(e => (e.status==='running' || (!e.stoppedAt && e.finished===false)) && e.startedAt && (now - new Date(e.startedAt).getTime() > STUCK));\nconst istNow = new Date(now + 5.5*3600000);\nconst istToday = istNow.toISOString().slice(0,10);\nconst ranToday = execs.some(e => e.startedAt && new Date(new Date(e.startedAt).getTime()+5.5*3600000).toISOString().slice(0,10) === istToday);\nconst pastWindow = istNow.getUTCHours() >= ((Number.isFinite(expectedHour)?expectedHour:0) + 1);\nconst missed = !ranToday && pastWindow;\nconst signals = [];\nif (apiDown) signals.push('Monitor could not read executions from the n8n API.');\nif (failed.length) signals.push('Failed executions: ' + failed.length + ' (latest id ' + (failed[0].id||'') + ').');\nif (stuck.length) signals.push('Stuck/long-running: ' + stuck.length + ' over ' + (Number(cfg.STUCK_MINUTES)||20) + ' min.');\nif (missed) signals.push('HEARTBEAT: scanner has NOT run today (expected ~' + (Number.isFinite(expectedHour)?expectedHour:0) + ':00 IST).');\nconst report = signals.length > 0;\nreturn [{ json: { report, signals, failed_count:failed.length, stuck_count:stuck.length, missed, api_down:apiDown, TEAMS_WEBHOOK_URL: cfg.TEAMS_WEBHOOK_URL||'', ALERTS_TASK_ID: cfg.ALERTS_TASK_ID||'', DASHBOARD_TASK_ID: cfg.DASHBOARD_TASK_ID||'', DASHBOARD_HISTORY_LIMIT: cfg.DASHBOARD_HISTORY_LIMIT||30 } }];\n"
+      },
+      "id": "node-health-eval",
+      "name": "Health Evaluator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-report",
+              "leftValue": "={{ $json.report }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "node-if-report",
+      "name": "IF Report",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const it = $input.first().json;\nconst title = '🩺 QA Scanner health alert';\nconst text = (it.signals||[]).join('\\n');\nconst color = (it.missed || it.api_down) ? 'D7263D' : 'E2A100';\nconst card = JSON.stringify({ '@type':'MessageCard', '@context':'http://schema.org/extensions', themeColor: color, summary: title, title: title, text: String(text).split('\\n').join('\\n\\n') });\nreturn [{ json: { notify_source:'monitor', notify_title:title, notify_text:text, teams_webhook_url: it.TEAMS_WEBHOOK_URL||'', teams_card: card, alerts_task_id: it.ALERTS_TASK_ID||'', clickup_comment_text: '🤖 '+title+'\\n\\n'+text } }];\n"
+      },
+      "id": "node-build-monitor",
+      "name": "Build Monitor Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const it = $input.first().json;\nconst sd = $getWorkflowStaticData('global');\nconst hist = Array.isArray(sd.runHistory) ? sd.runHistory : [];\nconst N = Number(it.DASHBOARD_HISTORY_LIMIT) || 30;\nconst recent = hist.slice(-N);\nlet upd=0, fail=0, tcs=0, succ=0;\nfor (const r of recent){ upd+=r.tickets_updated||0; fail+=r.tickets_failed||0; tcs+=r.tcs_created||0; if(r.status==='success')succ++; }\nconst rate = recent.length ? Math.round(100*succ/recent.length) : 0;\nconst last = recent[recent.length-1];\nconst lastLine = last ? (last.run_at + ' — scanned ' + last.tickets_scanned + ', updated ' + last.tickets_updated + ', skipped ' + last.tickets_skipped + ', failed ' + last.tickets_failed) : 'no runs yet';\nconst rows = recent.slice(-10).reverse().map(r => '| ' + String(r.run_at).slice(0,16).replace('T',' ') + ' | ' + r.status + ' | ' + (r.tickets_updated||0) + ' | ' + (r.tickets_failed||0) + ' | ' + (r.tcs_created||0) + ' |').join('\\n');\nconst md = '# QA TC Scanner — Dashboard (last ' + recent.length + ' runs)\\n\\n**Updated:** ' + upd + ' tickets  |  **Failed:** ' + fail + '  |  **TCs created:** ' + tcs + '  |  **Success rate:** ' + rate + '%\\n\\n**Last run:** ' + lastLine + '\\n\\n| Run | Status | Updated | Failed | TCs |\\n|---|---|---|---|---|\\n' + rows + '\\n\\n_Updated ' + new Date().toISOString() + '_';\nreturn [{ json: { dashboard_md: md, dashboard_task_id: it.DASHBOARD_TASK_ID||'' } }];\n"
+      },
+      "id": "node-build-dashboard",
+      "name": "Build Dashboard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        1320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.clickup.com/api/v2/task/{{ $json.dashboard_task_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ markdown_content: $json.dashboard_md }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "id": "node-update-dashboard",
+      "name": "Update Dashboard Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        1320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.teams_webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.teams_card }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "id": "node-notify-teams",
+      "name": "Notify Teams",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2600,
+        980
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.clickup.com/api/v2/task/{{ $json.alerts_task_id }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ comment_text: $json.clickup_comment_text, notify_all: false }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "clickup-header-auth",
+          "name": "ClickUp API (Header Auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "id": "node-notify-clickup",
+      "name": "Notify ClickUp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2820,
+        980
+      ]
     }
   ],
   "connections": {
@@ -603,7 +1328,13 @@
     },
     "Loop Each Ticket": {
       "main": [
-        [],
+        [
+          {
+            "node": "Build Run Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Get Ticket Detail",
@@ -686,7 +1417,7 @@
         ],
         [
           {
-            "node": "Loop Each Ticket",
+            "node": "Build Failure Comment",
             "type": "main",
             "index": 0
           }
@@ -759,7 +1490,7 @@
       "main": [
         [
           {
-            "node": "Loop Each Ticket",
+            "node": "Build TC Comment",
             "type": "main",
             "index": 0
           }
@@ -789,6 +1520,290 @@
         [
           {
             "node": "Verify Coverage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Summary": {
+      "main": [
+        [
+          {
+            "node": "Notify Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build TC Comment": {
+      "main": [
+        [
+          {
+            "node": "Comment TCs Added",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comment TCs Added": {
+      "main": [
+        [
+          {
+            "node": "Loop Each Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure Comment": {
+      "main": [
+        [
+          {
+            "node": "Comment Generation Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comment Generation Failure": {
+      "main": [
+        [
+          {
+            "node": "Loop Each Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Remediation Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remediation Config": {
+      "main": [
+        [
+          {
+            "node": "Classify Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Failure": {
+      "main": [
+        [
+          {
+            "node": "IF Known",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Known": {
+      "main": [
+        [
+          {
+            "node": "Re-run Guard",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DeepSeek Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DeepSeek Classify": {
+      "main": [
+        [
+          {
+            "node": "Parse Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classify": {
+      "main": [
+        [
+          {
+            "node": "Re-run Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-run Guard": {
+      "main": [
+        [
+          {
+            "node": "IF Auto-fix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Auto-fix": {
+      "main": [
+        [
+          {
+            "node": "Re-trigger Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Remediation Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-trigger Scanner": {
+      "main": [
+        [
+          {
+            "node": "Build Remediation Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Remediation Notification": {
+      "main": [
+        [
+          {
+            "node": "Notify Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monitor Schedule": {
+      "main": [
+        [
+          {
+            "node": "Monitor Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monitor Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch Executions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Executions": {
+      "main": [
+        [
+          {
+            "node": "Health Evaluator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Health Evaluator": {
+      "main": [
+        [
+          {
+            "node": "IF Report",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Report": {
+      "main": [
+        [
+          {
+            "node": "Build Monitor Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Build Monitor Notification": {
+      "main": [
+        [
+          {
+            "node": "Notify Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dashboard": {
+      "main": [
+        [
+          {
+            "node": "Update Dashboard Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Teams": {
+      "main": [
+        [
+          {
+            "node": "Notify ClickUp",
             "type": "main",
             "index": 0
           }

@@ -32,22 +32,29 @@ CRON (daily 00:00 IST)
 - A running **n8n** instance (cloud or self-hosted).
 - A **ClickUp API token** (`pk_...`): ClickUp → Settings → Apps → Generate.
 - A **DeepSeek API key** (`sk-...`): https://platform.deepseek.com → API Keys.
+- An **n8n API key** (for the monitoring branch): n8n → Settings → n8n API → Create an API key.
+- A **Microsoft Teams incoming-webhook URL** (for alerts): Teams channel → Connectors → Incoming Webhook.
 
 ## Setup
 
-### 1. Create the two credentials in n8n
+### 1. Create the credentials in n8n
 
-Both are **HTTP Header Auth** credentials (Credentials → New → *Header Auth*):
+All three are **HTTP Header Auth** credentials (Credentials → New → *Header Auth*):
 
 | Credential name | Header Name | Header Value |
 |-----------------|-------------|--------------|
 | `ClickUp API` | `Authorization` | `pk_your_clickup_token` *(no `Bearer`)* |
 | `DeepSeek API` | `Authorization` | `Bearer sk_your_deepseek_key` |
+| `n8n API (Header Auth)` | `X-N8N-API-KEY` | `your_n8n_api_key` |
+
+The first two were always required (ClickUp read/write, DeepSeek generation). `n8n API (Header Auth)` is **new** — the monitoring branch uses it to read `/api/v1/executions`. The **Microsoft Teams webhook is not a credential**; you paste it into the config as `TEAMS_WEBHOOK_URL` (see step 3).
 
 ### 2. Import the workflow
 
 Settings → **Import from File** → select `qa-tc-scanner-workflow.json`.
-When prompted, map the two credentials above to the **DeepSeek Generate TCs** node and the two **ClickUp** HTTP nodes (Fetch + Create).
+When prompted, map the credentials above: `ClickUp API` and `DeepSeek API` to their HTTP nodes (ClickUp Fetch/Create/comment/dashboard/alert nodes; DeepSeek generate + classify), and `n8n API (Header Auth)` to the monitoring **Fetch Executions** node.
+
+> **One-time manual step (required for self-heal):** after import, open the workflow's **Settings → Error Workflow** and select **this same workflow**. That wires the `Error Trigger` (remediation branch) to fire when the workflow fails. The workflow's internal id isn't known until import, so it cannot be pre-set in the JSON. Without this step the remediation agent never runs.
 
 ### 3. Configure (the **Set Config** node)
 
@@ -68,6 +75,18 @@ All behavior is driven from this one node — no need to edit code:
 | `MIN_TCS` | `12` | Minimum test cases; the model increases this until all scenario types are covered. |
 | `VERIFY_MAX_RETRIES` | `2` | How many times the verify step re-creates missing `[TC]` subtasks before throwing. |
 | `TEAM_ID` | `9016989623` | ClickUp workspace/team id (reference). |
+| `MAIN_WORKFLOW_ID` | *(set after import)* | This workflow's id — the monitor reads its executions; the remediation agent re-triggers it. |
+| `N8N_BASE_URL` | *(your n8n URL)* | Base URL of your n8n instance, for the `/api/v1/executions` call. |
+| `MAX_AUTO_RERUNS_PER_DAY` | `2` | Cap on remediation auto-reruns per day (`staticData.reruns`). |
+| `STUCK_MINUTES` | `20` | An execution running longer than this is flagged as stuck. |
+| `EXPECTED_RUN_HOUR` | `0` | Hour (IST) the daily run is expected — drives the missed-run heartbeat. |
+| `TEAMS_WEBHOOK_URL` | *(your webhook)* | Microsoft Teams incoming-webhook URL for alerts. |
+| `ALERTS_CLICKUP_LIST_ID` | *(your list)* | ClickUp list for alert comments. |
+| `ALERTS_TASK_ID` | *(your task)* | ClickUp task that receives alert comments. |
+| `DASHBOARD_TASK_ID` | *(your task)* | The dedicated "QA Bot Dashboard" ClickUp task overwritten each monitor run. |
+| `DASHBOARD_HISTORY_LIMIT` | `30` | How many recent runs the dashboard view renders. |
+
+> **Keep the per-branch config in sync.** The remediation and monitoring branches run as **separate executions** and cannot read the main `Set Config` node, so each carries its own config Set node (`Remediation Config` / `Monitor Config`). If you change any of the reliability keys above, update them in all the relevant config Set nodes.
 
 ### 4. Test, then activate
 
@@ -84,6 +103,19 @@ All behavior is driven from this one node — no need to edit code:
 | No `[TC]`, description ≥ `MIN_DESC_LENGTH` | **generate** test cases |
 | No `[TC]`, thin description | **monitor** (flagged, not generated) |
 
+## Reliability & monitoring
+
+The workflow JSON now contains **three trigger-rooted branches on one canvas** that share a notifier, so the daily scanner runs unattended *and* watches/heals itself:
+
+- **Per-ticket comments + run summary.** On success a ticket gets an "added N test cases (by type/priority)" ClickUp comment; on a parse failure it gets a "generation failed" comment. At the end of each run a **run summary** of KPIs is recorded and posted.
+- **Remediation / self-heal agent** (rooted at an **Error Trigger**). When the workflow fails, it classifies the error (transient rate-limit / upstream / generation-parse / coverage-incomplete / auth / unknown), **always alerts**, and **auto-re-runs only transient, idempotent-safe failures** — capped at `MAX_AUTO_RERUNS_PER_DAY` per day. **Auth errors are escalate-only.** (Requires the *Settings → Error Workflow → this workflow* step above.)
+- **Monitoring / health agent** (a **30-minute schedule**). It reads the n8n `/api/v1/executions` API and computes four signals: failed executions, a **missed-run heartbeat** (dead-man's-switch for the 00:00 IST run), **stuck/long-running** executions (`STUCK_MINUTES`), and run KPIs — alerting when something looks wrong.
+- **Live ClickUp dashboard.** The monitor also overwrites a dedicated **"QA Bot Dashboard"** ClickUp task (`DASHBOARD_TASK_ID`) with a rolling "tickets updated / failed in the last N runs" view.
+- **Shared alerting** goes to **Microsoft Teams** (a MessageCard to your webhook) **and ClickUp** (a comment).
+- **Three nested retry ceilings:** per-node `retryOnFail` (429 backoff) → in-run `VERIFY_MAX_RETRIES` (coverage self-heal) → cross-run `MAX_AUTO_RERUNS_PER_DAY` (remediation agent).
+
+Cross-execution state (run history, the per-day rerun counter, in-flight run bookkeeping) lives in n8n workflow `staticData` (`runHistory`, `reruns`, `currentRun`).
+
 ## Test case types generated
 
 Smoke · Functional – Positive · Functional – Negative · Security · Performance · Non-Functional · Edge Case · Regression.
@@ -96,4 +128,4 @@ Smoke · Functional – Positive · Functional – Negative · Security · Perfo
 - **Fetch is parents-only and paginated; coverage is checked per ticket.** Fetching the list with `subtasks=true` was unreliable (subtasks flooded page 0). Instead the Fetch node pulls **parent tickets only** (`subtasks=false`), **paginated** (`page` until `last_page`, up to 200 pages) so lists with >100 parents aren't truncated — and the detection node **throws** if it detects a truncated page. Each ticket's `[TC]` coverage and requirement then come from `GET /task/{id}?include_subtasks=true&include_markdown_description=true`, which returns subtasks **nested** and reliable.
 - **Every in-scope ticket is processed each run** (`AUTO_ADJUST_BATCH=true`), so none are left in overflow; already-covered tickets skip fast.
 - **Each ticket is verified after creation.** The workflow re-reads the ticket, confirms every generated `[TC]` exists, recreates any missing (up to `VERIFY_MAX_RETRIES`), and **throws/stops** if it still can't reach full coverage.
-- **Not yet built:** a run-summary / Slack / email / webhook notification. The pipeline currently ends after writing subtasks. See the "Stylize" phase in `B.L.A.S.T.md`.
+- **Now built:** run-summary notifications, per-ticket comments, an Error-Trigger self-heal agent, and a scheduled monitor + ClickUp dashboard — alerting to Microsoft Teams + ClickUp. See "Reliability & monitoring" above and the "Stylize" phase in `B.L.A.S.T.md`. (Slack/email channels are still not wired.)

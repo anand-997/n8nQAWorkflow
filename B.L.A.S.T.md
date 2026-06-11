@@ -118,7 +118,14 @@ The real, ordered node list (14 nodes): Daily Midnight IST → Set Config → **
 
 **1. Payload Refinement:** The delivered subtask is styled via the `markdown_description` template in **Create TC Subtask in ClickUp** — sectioned headers for Test Case Details, Preconditions, Steps, Test Data, and Expected Result. Keep this readable and consistent; it is the human-facing artifact.
 
-**2. The main unbuilt feature — Summary Notification.** The pipeline currently **ends at the Wait node**. There is no run-summary / report / Slack / email / webhook node. Building this (aggregate counts → notify) is the primary Stylize-phase work item. Treat it as a feature to add, not a regression.
+**2. Summary Notification & reliability — now built (three trigger-rooted branches).** What was the primary Stylize work item is done. The single workflow JSON now hosts **three independent trigger-rooted branches on one canvas that share a notifier**:
+
+- **Branch 1 — Daily scanner** (the pipeline above, rooted at the Schedule Trigger), now with a **Build Run Summary** node, per-ticket success/failure ClickUp comments, and an `Execute Workflow Trigger` alternate entry.
+- **Branch 2 — Remediation / self-heal agent**, rooted at an **Error Trigger**: classifies a failure (deterministic rules, DeepSeek fallback for unknowns), always alerts, and auto-re-runs only transient/idempotent-safe failures, capped by `MAX_AUTO_RERUNS_PER_DAY`; auth errors are escalate-only.
+- **Branch 3 — Monitoring / health agent**, rooted at a 30-minute **Monitor Schedule**: reads the n8n executions API for failed/missed/stuck runs + KPIs, alerts on problems, and maintains a rolling ClickUp "QA Bot Dashboard" task.
+- **Shared notifier** — `Notify Teams → Notify ClickUp` — fans alerts out to Microsoft Teams and ClickUp.
+
+Cross-execution state lives in workflow `staticData` (`runHistory`, `reruns`, `currentRun`). See `CLAUDE.md` ("Three-branch architecture") for node-level detail and the one-time **Settings → Error Workflow → this workflow** step that arms the Error Trigger.
 
 **3. Feedback:** Present a sample generated subtask and (once built) a sample summary to the user before activating the schedule.
 
